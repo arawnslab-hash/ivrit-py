@@ -14,12 +14,13 @@ Local-engine cases use faster-whisper; RunPod cases require
 RUNPOD_API_KEY / RUNPOD_ENDPOINT_ID.
 """
 
+import json
 import os
 import pytest
 from pathlib import Path
 
 from ivrit import load_model
-from ivrit.audio import TranscriptionModel
+from ivrit.audio import RunPodModel, TranscriptionModel
 from ivrit.types import Segment, Word
 from ivrit.utils import emit_progress
 
@@ -264,3 +265,103 @@ class TestBatchTranscription:
             self._assert_valid_segment(payload)
 
         assert seen_indices == {0, 1}, f"Expected indices {{0, 1}}, got {seen_indices}"
+
+
+class TestPlanBlobChunks:
+    """Unit tests for RunPodModel._plan_blob_chunks — a credential-free
+    staticmethod, so no RunPod env vars are needed."""
+
+    def test_all_fit_single_chunk(self):
+        encoded = ["a", "bb", "ccc"]
+        chunks = RunPodModel._plan_blob_chunks(encoded, envelope_overhead=10, cap=1000)
+        assert chunks == [[0, 1, 2]]
+
+    def test_overflow_splits_preserving_order(self):
+        # Each element JSON-encodes to 6 bytes ("xxxx" + quotes) plus a 2-byte
+        # separator => 8 bytes. With overhead 10 and cap 26 only two elements
+        # fit per chunk.
+        encoded = ["aaaa", "bbbb", "cccc", "dddd", "eeee"]
+        overhead = 10
+        cap = 26
+        chunks = RunPodModel._plan_blob_chunks(encoded, envelope_overhead=overhead, cap=cap)
+
+        # Concatenation equals the full ordered index range.
+        flattened = [i for chunk in chunks for i in chunk]
+        assert flattened == list(range(len(encoded)))
+        assert len(chunks) > 1, "Expected the batch to split into multiple chunks"
+
+        # Each chunk's modeled byte cost fits the cap.
+        def chunk_bytes(chunk):
+            return overhead + sum(
+                len(json.dumps(encoded[i]).encode("utf-8")) + len(b", ") for i in chunk
+            )
+
+        for chunk in chunks:
+            assert chunk_bytes(chunk) <= cap, f"Chunk {chunk} exceeds cap"
+
+    def test_single_element_over_cap_raises(self):
+        encoded = ["a" * 100]
+        with pytest.raises(ValueError):
+            RunPodModel._plan_blob_chunks(encoded, envelope_overhead=10, cap=20)
+
+    def test_boundary_element_at_cap_edge(self):
+        # Construct an element whose cost exactly hits the remaining room so a
+        # single element fills a chunk to the cap boundary.
+        element = "x" * 8
+        cost = len(json.dumps(element).encode("utf-8")) + len(b", ")
+        overhead = 5
+        cap = overhead + cost  # exactly one element fits per chunk
+        encoded = [element, element, element]
+        chunks = RunPodModel._plan_blob_chunks(encoded, envelope_overhead=overhead, cap=cap)
+
+        assert [i for chunk in chunks for i in chunk] == [0, 1, 2]
+        assert all(len(chunk) == 1 for chunk in chunks), "Expected one element per chunk at the boundary"
+
+    def test_chunks_assembled_payload_within_cap_via_model(self):
+        """Plan over real encoded blobs through a dummy-credentialed model and
+        confirm each chunk's assembled payload byte length is within the cap."""
+        model = RunPodModel(model="m", api_key="x", endpoint_id="y")
+        model.RUNPOD_MAX_PAYLOAD_LEN = 4096
+
+        # Several base64-ish blobs that overflow the small cap together.
+        encoded = ["A" * 800 for _ in range(10)]
+        output_options = {"word_timestamps": True, "extra_data": True}
+        empty_payload = model._assemble_payload(
+            kind="blob",
+            source_value=[],
+            language="he",
+            diarize=False,
+            diarization_args=None,
+            output_options=output_options,
+            verbose=False,
+        )
+        overhead = model._payload_byte_len(empty_payload)
+        chunks = model._plan_blob_chunks(encoded, overhead, model.RUNPOD_MAX_PAYLOAD_LEN)
+
+        assert [i for chunk in chunks for i in chunk] == list(range(len(encoded)))
+        assert len(chunks) > 1, "Expected the oversized batch to split"
+        for chunk in chunks:
+            payload = model._assemble_payload(
+                kind="blob",
+                source_value=[encoded[i] for i in chunk],
+                language="he",
+                diarize=False,
+                diarization_args=None,
+                output_options=output_options,
+                verbose=False,
+            )
+            assert model._payload_byte_len(payload) <= model.RUNPOD_MAX_PAYLOAD_LEN
+
+
+class TestPayloadByteLen:
+    """Unit tests for RunPodModel._payload_byte_len — counts JSON UTF-8 bytes."""
+
+    def test_counts_multibyte_utf8(self):
+        # Hebrew characters are 2 bytes each in UTF-8.
+        payload = {"text": "שלום"}
+        expected = len(json.dumps(payload).encode("utf-8"))
+        assert RunPodModel._payload_byte_len(payload) == expected
+
+    def test_larger_than_str_repr_for_non_ascii(self):
+        payload = {"text": "שלום עולם"}
+        assert RunPodModel._payload_byte_len(payload) > len(str(payload))

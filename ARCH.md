@@ -71,9 +71,14 @@ layers. Engine-specific data that doesn't fit the schema lives in
     on the direct `_transcribe_one` / `_transcribe_one_async` path). The default
     bodies are the per-item fan-out loop (sequential, per-item error isolation,
     per-item `_wrap_progress` attribution). `RunPodModel` overrides both to
-    submit **one** remote job carrying a list payload and demux the
-    index-tagged stream instead of issuing N jobs. The seams own the per-item
-    progress wrapping; source normalization stays in the public methods.
+    submit a remote job carrying a list payload and demux the index-tagged
+    stream instead of issuing N single-source jobs. A URL batch, and a
+    blob/path batch that fits the payload cap, run as **one** job; a blob/path
+    batch whose combined payload exceeds the cap is split by a greedy in-order
+    chunk planner into **N sequential jobs**, each remapping its worker-local
+    indices back to caller global indices so the caller contract is identical
+    regardless of job count. The seams own the per-item progress wrapping;
+    source normalization stays in the public methods.
 
   All transcription entry points accept an optional `on_progress:
   Callable[[dict], None]` callback. It is invoked periodically as work
@@ -251,13 +256,18 @@ of a transcribe-then-diarize run.
    single-file path (sync via `_transcribe_one`, async via
    `_transcribe_one_async`) in input order, with results attributed by their
    input index and per-item errors isolated rather than aborting the batch.
-   `RunPodModel` overrides the seam to collapse the whole list into **one**
-   remote job (a single payload whose `transcribe_args` source key is a list)
-   and demuxes the worker's index-tagged stream back into per-item results.
-   `RUNPOD_MAX_PAYLOAD_LEN` is enforced on the whole batched payload, raised
-   eagerly before submission: URL batches stay small and scale well, while
-   blob/path batches can exceed the cap and raise `ValueError` (aborting the
-   entire batch, since the cap is a property of the combined payload). Error
+   `RunPodModel` overrides the seam to carry the list as a single payload whose
+   `transcribe_args` source key is a list, and demuxes the worker's
+   index-tagged stream back into per-item results. `RUNPOD_MAX_PAYLOAD_LEN` is
+   measured as JSON UTF-8 bytes (not `str(payload)`, which undercounts
+   non-ASCII like Hebrew) and is enforced before submission. URL batches never
+   split: they stay small and scale well, so the whole list is one job. A
+   blob/path batch over the cap is split by a greedy in-order chunk planner
+   (`_plan_blob_chunks`) into multiple sequential jobs that each fit; each
+   chunk's worker-local indices (0..k-1) are remapped back to caller global
+   indices, so the caller-visible streaming and non-streaming contracts are
+   identical whether 1 or N jobs ran. A single blob/path element that alone
+   exceeds the cap still raises `ValueError`. Error
    handling is deliberately asymmetric: a per-item worker error is isolated as
    `(index, Exception)` (streaming) or `{"error": ...}` (non-streaming), whereas
    a whole-job failure (network/queue `TimeoutError`, payload-too-large

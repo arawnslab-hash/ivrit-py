@@ -1824,6 +1824,170 @@ class RunPodModel(TranscriptionModel):
         
         return session
 
+    @staticmethod
+    def _payload_byte_len(payload) -> int:
+        """Return the JSON UTF-8 byte length of a payload — the size that
+        actually goes on the wire, which correctly counts multi-byte
+        (e.g. Hebrew) characters that ``len(str(payload))`` would undercount."""
+        return len(json.dumps(payload).encode("utf-8"))
+
+    def _encode_sources(self, kind: str, items: List[str]) -> List[str]:
+        """Encode each batch element exactly once: path -> read file +
+        base64; blob/url -> passthrough. The returned values are reused for
+        both bin-packing and payload assembly so a file is never read twice."""
+        def encode_element(element: str) -> str:
+            if kind == "path":
+                try:
+                    with open(element, 'rb') as f:
+                        audio_data = f.read()
+                    return base64.b64encode(audio_data).decode('utf-8')
+                except Exception as e:
+                    logger.error(f"Failed to read audio file for RunPod: {e}")
+                    raise Exception(f"Failed to read audio file: {e}")
+            return element
+
+        return [encode_element(element) for element in items]
+
+    def _assemble_payload(
+        self,
+        *,
+        kind: str,
+        source_value: Union[str, List[str]],
+        language: Optional[str],
+        diarize: bool,
+        diarization_args: Optional[Dict[str, Any]],
+        output_options: Dict[str, Any],
+        verbose: bool,
+        **kwargs,
+    ) -> dict:
+        """
+        Build the RunPod job payload dict from an already-encoded
+        ``source_value`` (a scalar for single-source mode, or a list for batch
+        mode). The list-ness of ``source_value`` is preserved into the
+        ``transcribe_args`` source key (``url`` / ``blob``); the scalar
+        top-level ``type`` field ("blob"/"url") is unaffected by list-ness.
+        """
+        if kind == "path" or kind == "blob":
+            payload_type = "blob"
+            source_key = "blob"
+        elif kind == "url":
+            payload_type = "url"
+            source_key = "url"
+        else:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        return {
+            "input": {
+                "type": payload_type,
+                "model": self.model,
+                "engine": self.core_engine,
+                "streaming": True,
+                "transcribe_args": {
+                    "language": language,
+                    "diarize": diarize,
+                    "diarization_args": diarization_args,
+                    "output_options": output_options,
+                    "verbose": verbose,
+                    source_key: source_value,
+                    **kwargs
+                }
+            }
+        }
+
+    @staticmethod
+    def _plan_blob_chunks(
+        encoded_elements: List[str],
+        envelope_overhead: int,
+        cap: int,
+    ) -> List[List[int]]:
+        """
+        Plan how to split blob/path batch elements into chunks that each fit
+        within ``cap`` JSON UTF-8 bytes, returning a list of chunks where each
+        chunk is a list of indices into ``encoded_elements``.
+
+        Greedy first-fit IN ORDER: append items to the current chunk until
+        adding the next would exceed ``cap``, then start a new chunk. Input
+        order is preserved; the concatenation of all chunks == ``[0..n-1]``.
+
+        Fit model: ``envelope_overhead + sum(per-element cost) <= cap``, where
+        ``envelope_overhead`` is the byte length of the assembled payload with
+        an EMPTY source list, and per-element cost is the element's JSON-string
+        byte length plus the list-separator overhead.
+
+        If a single element alone cannot fit
+        (``envelope_overhead + that element's cost > cap``), raises
+        ``ValueError`` reporting the offending size and the cap. This is the
+        home of the eager raise for an unsplittable single blob.
+
+        ``self``-free (staticmethod) so it is unit-testable without a
+        credentialed model.
+        """
+        # Per-element cost: JSON-string byte length plus a separator (", ").
+        def element_cost(element: str) -> int:
+            return len(json.dumps(element).encode("utf-8")) + len(b", ")
+
+        chunks: List[List[int]] = []
+        current: List[int] = []
+        current_size = envelope_overhead
+
+        for i, element in enumerate(encoded_elements):
+            cost = element_cost(element)
+            if envelope_overhead + cost > cap:
+                raise ValueError(
+                    f"Single source element length is {cost}, exceeding max "
+                    f"payload length of {cap}"
+                )
+            if current and current_size + cost > cap:
+                chunks.append(current)
+                current = []
+                current_size = envelope_overhead
+            current.append(i)
+            current_size += cost
+
+        if current:
+            chunks.append(current)
+
+        return chunks
+
+    def _plan_batch_chunks(
+        self,
+        *,
+        kind: str,
+        encoded: List[str],
+        language: Optional[str],
+        diarize: bool,
+        diarization_args: Optional[Dict[str, Any]],
+        output_options: Dict[str, Any],
+        verbose: bool,
+        **kwargs,
+    ) -> List[List[int]]:
+        """
+        Decide how a batch of already-encoded elements maps to RunPod jobs
+        (one chunk == one job), returning chunks of global indices in order.
+
+        URL batches are never split: they stay small and scale well, so the
+        whole batch is one chunk. blob/path batches are split via
+        ``_plan_blob_chunks`` so each resulting job's payload fits the cap; the
+        envelope overhead is measured from an assembled payload with an empty
+        source list. A single blob/path element alone over the cap raises
+        ``ValueError`` (inside ``_plan_blob_chunks``).
+        """
+        if kind == "url":
+            return [list(range(len(encoded)))]
+
+        empty_payload = self._assemble_payload(
+            kind=kind,
+            source_value=[],
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            **kwargs,
+        )
+        envelope_overhead = self._payload_byte_len(empty_payload)
+        return self._plan_blob_chunks(encoded, envelope_overhead, self.RUNPOD_MAX_PAYLOAD_LEN)
+
     def _build_payload(
         self,
         *,
@@ -1854,59 +2018,32 @@ class RunPodModel(TranscriptionModel):
         """
         is_list = isinstance(source, list)
 
-        if kind == "path" or kind == "blob":
-            payload_type = "blob"
-            source_key = "blob"
-        elif kind == "url":
-            payload_type = "url"
-            source_key = "url"
-        else:
-            raise ValueError("Must specify either 'path', 'url', or 'blob'")
-
         if verbose:
             logger.info(f"Using RunPod engine with model: {self.model}")
-            logger.info(f"Payload type: {payload_type}")
             logger.info(f"Data source: {source}")
 
-        def encode_element(element: str) -> str:
-            if kind == "path":
-                try:
-                    with open(element, 'rb') as f:
-                        audio_data = f.read()
-                    return base64.b64encode(audio_data).decode('utf-8')
-                except Exception as e:
-                    logger.error(f"Failed to read audio file for RunPod: {e}")
-                    raise Exception(f"Failed to read audio file: {e}")
-            return element
-
         if is_list:
-            source_value = [encode_element(element) for element in source]
+            source_value = self._encode_sources(kind, source)
         else:
-            source_value = encode_element(source)
+            source_value = self._encode_sources(kind, [source])[0]
 
-        payload = {
-            "input": {
-                "type": payload_type,
-                "model": self.model,
-                "engine": self.core_engine,
-                "streaming": True,
-                "transcribe_args": {
-                    "language": language,
-                    "diarize": diarize,
-                    "diarization_args": diarization_args,
-                    "output_options": output_options,
-                    "verbose": verbose,
-                    source_key: source_value,
-                    **kwargs
-                }
-            }
-        }
+        payload = self._assemble_payload(
+            kind=kind,
+            source_value=source_value,
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            **kwargs,
+        )
 
         # Check payload size on the whole (possibly batched) payload.
-        if len(str(payload)) > self.RUNPOD_MAX_PAYLOAD_LEN:
+        payload_len = self._payload_byte_len(payload)
+        if payload_len > self.RUNPOD_MAX_PAYLOAD_LEN:
             scope = "batched payload" if is_list else "payload"
-            logger.error(f"RunPod {scope} too large: {len(str(payload))} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
-            raise ValueError(f"{scope.capitalize()} length is {len(str(payload))}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
+            logger.error(f"RunPod {scope} too large: {payload_len} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
+            raise ValueError(f"{scope.capitalize()} length is {payload_len}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
 
         return payload
 
@@ -2112,8 +2249,12 @@ class RunPodModel(TranscriptionModel):
         **kwargs,
     ) -> Union[Generator, List[dict]]:
         """
-        RunPod batch override: submit ONE job with a list payload and demux the
-        index-tagged stream, rather than fanning out one job per item.
+        RunPod batch override. For URL batches and blob/path batches that fit
+        the payload cap this submits ONE job with a list payload. A blob/path
+        batch whose combined payload exceeds the cap is split into multiple
+        sequential jobs via a greedy in-order chunk planner; each job's
+        worker-local indices are remapped back to caller GLOBAL indices so the
+        caller-visible contract is identical regardless of job count.
         """
         # Validate diarization support
         if diarize and self.core_engine != "stable-whisper":
@@ -2130,10 +2271,11 @@ class RunPodModel(TranscriptionModel):
 
         total = len(items)
 
-        # Build the single batched payload eagerly (payload cap enforced inside).
-        payload = self._build_payload(
+        # Encode each item exactly once and plan the chunks (one chunk = one job).
+        encoded = self._encode_sources(kind, items)
+        chunks = self._plan_batch_chunks(
             kind=kind,
-            source=items,
+            encoded=encoded,
             language=language,
             diarize=diarize,
             diarization_args=diarization_args,
@@ -2142,30 +2284,48 @@ class RunPodModel(TranscriptionModel):
             **kwargs,
         )
 
+        def chunk_payload(chunk: List[int]) -> dict:
+            return self._assemble_payload(
+                kind=kind,
+                source_value=[encoded[g] for g in chunk],
+                language=language,
+                diarize=diarize,
+                diarization_args=diarization_args,
+                output_options=output_options,
+                verbose=verbose,
+                **kwargs,
+            )
+
         if stream:
             def batch_generator():
-                for index, item in self._run_job_stream(payload, on_progress):
-                    if isinstance(item, Segment):
-                        yield (index, item)
-                    elif isinstance(item, dict) and "progress" in item:
-                        wrapped = self._wrap_progress(on_progress, index, total)
-                        self._emit_worker_progress(wrapped, item["progress"])
-                    elif isinstance(item, Exception):
-                        yield (index, item)
+                for chunk in chunks:
+                    payload = chunk_payload(chunk)
+                    for local_index, item in self._run_job_stream(payload, on_progress):
+                        global_index = chunk[local_index]
+                        if isinstance(item, Segment):
+                            yield (global_index, item)
+                        elif isinstance(item, dict) and "progress" in item:
+                            wrapped = self._wrap_progress(on_progress, global_index, total)
+                            self._emit_worker_progress(wrapped, item["progress"])
+                        elif isinstance(item, Exception):
+                            yield (global_index, item)
             return batch_generator()
 
         # Non-streaming: stream under the hood and collect into List[dict] in
         # input order.
         segments_by_index: Dict[int, List[Segment]] = {i: [] for i in range(total)}
         error_by_index: Dict[int, Exception] = {}
-        for index, item in self._run_job_stream(payload, on_progress):
-            if isinstance(item, Segment):
-                segments_by_index[index].append(item)
-            elif isinstance(item, dict) and "progress" in item:
-                wrapped = self._wrap_progress(on_progress, index, total)
-                self._emit_worker_progress(wrapped, item["progress"])
-            elif isinstance(item, Exception):
-                error_by_index[index] = item
+        for chunk in chunks:
+            payload = chunk_payload(chunk)
+            for local_index, item in self._run_job_stream(payload, on_progress):
+                global_index = chunk[local_index]
+                if isinstance(item, Segment):
+                    segments_by_index[global_index].append(item)
+                elif isinstance(item, dict) and "progress" in item:
+                    wrapped = self._wrap_progress(on_progress, global_index, total)
+                    self._emit_worker_progress(wrapped, item["progress"])
+                elif isinstance(item, Exception):
+                    error_by_index[global_index] = item
 
         results: List[dict] = []
         for i in range(total):
@@ -2380,10 +2540,13 @@ class RunPodModel(TranscriptionModel):
         **kwargs,
     ) -> AsyncGenerator[tuple[int, Union[Segment, Exception]], None]:
         """
-        RunPod async batch override: submit ONE job with a list payload and
-        demux the index-tagged stream, yielding ``(index, Segment)`` and routing
-        per-index progress to a wrapped callback. Per-index worker errors surface
-        as ``(index, Exception)`` without aborting the rest of the stream.
+        RunPod async batch override. URL batches and blob/path batches that fit
+        the cap run as ONE job; an overflowing blob/path batch is split into
+        multiple sequential jobs via the greedy in-order chunk planner. Each
+        job's worker-local indices are remapped to caller GLOBAL indices,
+        yielding ``(index, Segment)`` and routing per-index progress to a
+        wrapped callback. Per-index worker errors surface as
+        ``(index, Exception)`` without aborting the rest of the stream.
         """
         # Validate diarization support
         if diarize and self.core_engine != "stable-whisper":
@@ -2400,9 +2563,10 @@ class RunPodModel(TranscriptionModel):
 
         total = len(items)
 
-        payload = self._build_payload(
+        encoded = self._encode_sources(kind, items)
+        chunks = self._plan_batch_chunks(
             kind=kind,
-            source=items,
+            encoded=encoded,
             language=language,
             diarize=diarize,
             diarization_args=diarization_args,
@@ -2411,14 +2575,26 @@ class RunPodModel(TranscriptionModel):
             **kwargs,
         )
 
-        async for index, item in self._run_job_stream_async(payload, on_progress):
-            if isinstance(item, Segment):
-                yield (index, item)
-            elif isinstance(item, dict) and "progress" in item:
-                wrapped = self._wrap_progress(on_progress, index, total)
-                self._emit_worker_progress(wrapped, item["progress"])
-            elif isinstance(item, Exception):
-                yield (index, item)
+        for chunk in chunks:
+            chunk_payload = self._assemble_payload(
+                kind=kind,
+                source_value=[encoded[g] for g in chunk],
+                language=language,
+                diarize=diarize,
+                diarization_args=diarization_args,
+                output_options=output_options,
+                verbose=verbose,
+                **kwargs,
+            )
+            async for local_index, item in self._run_job_stream_async(chunk_payload, on_progress):
+                global_index = chunk[local_index]
+                if isinstance(item, Segment):
+                    yield (global_index, item)
+                elif isinstance(item, dict) and "progress" in item:
+                    wrapped = self._wrap_progress(on_progress, global_index, total)
+                    self._emit_worker_progress(wrapped, item["progress"])
+                elif isinstance(item, Exception):
+                    yield (global_index, item)
 
 
 def load_model(
