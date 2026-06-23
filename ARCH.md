@@ -42,12 +42,38 @@ layers. Engine-specific data that doesn't fit the schema lives in
 - **`TranscriptionModel`** (ABC) — the engine-agnostic interface. Concrete
   subclasses implement engine-specific transcription. Defines:
   - `transcribe(*, path|url|blob, language, stream, diarize, diarization_args,
-    output_options, verbose, on_progress, **kwargs)` — sync entry point
-    returning either a `dict` or a `Generator[Segment]` depending on `stream`.
-  - `transcribe_async(...)` — async variant returning an `AsyncGenerator` /
-    awaitable.
+    output_options, verbose, on_progress, **kwargs)` — sync entry point. Each of
+    `path`/`url`/`blob` accepts `Union[str, List[str]]`. A bare string selects
+    single-file mode and returns either a `dict` or a `Generator[Segment]`
+    depending on `stream` (byte-for-byte unchanged behavior). A list — even a
+    one-element list like `path=["a.mp3"]` — selects **batch mode** and drives
+    the return type: `stream=False` returns `List[dict]` (one entry per input,
+    in input order; a failed item is isolated as
+    `{"error": str, "source": kind, "input": value}`), and `stream=True` returns
+    `Generator[Tuple[int, Union[Segment, Exception]]]` yielding `(index, Segment)`
+    and, on per-item failure, a single `(index, exc)` before continuing. Sources
+    are mutually exclusive and a batch is homogeneous (no mixing kinds); an empty
+    list raises `ValueError`. Batch items are processed strictly sequentially.
+  - `transcribe_async(...)` — async variant; **always streams**. Single-file mode
+    yields `Segment` objects; batch mode (list source) yields
+    `AsyncGenerator[Tuple[int, Union[Segment, Exception]]]` with the same
+    `(index, Segment)` / `(index, exc)` shape and per-item isolation. Internally
+    delegates to `_transcribe_one_async(...)`, the single-source async seam
+    (RunPod overrides `_transcribe_one_async` with its native aiohttp
+    implementation; the batch-aware `transcribe_async` is the non-overridden base
+    that fans single-source calls out sequentially). The sync batch path likewise
+    funnels each item through the single-source `_transcribe_one(...)` helper.
   - `create_session(...)` — optional, raises `NotImplementedError` by default.
     Only engines that natively support incremental decoding override it.
+  - `_transcribe_batch(...)` / `_transcribe_batch_async(...)` — the overridable
+    **batch seam**. After `transcribe` / `transcribe_async` eagerly validate the
+    sources, the batch branch delegates to these methods (single-file calls stay
+    on the direct `_transcribe_one` / `_transcribe_one_async` path). The default
+    bodies are the per-item fan-out loop (sequential, per-item error isolation,
+    per-item `_wrap_progress` attribution). `RunPodModel` overrides both to
+    submit **one** remote job carrying a list payload and demux the
+    index-tagged stream instead of issuing N jobs. The seams own the per-item
+    progress wrapping; source normalization stays in the public methods.
 
   All transcription entry points accept an optional `on_progress:
   Callable[[dict], None]` callback. It is invoked periodically as work
@@ -72,7 +98,11 @@ layers. Engine-specific data that doesn't fit the schema lives in
   with `info.duration`; stable-whisper: native `progress_callback`;
   whisper-cpp: native `new_segment_callback`; runpod: `progress` items
   on the worker stream protocol). Per-engine details for the
-  diarization phase are listed in the Diarization Layer section below.
+  diarization phase are listed in the Diarization Layer section below. In batch
+  mode the `on_progress` callback is wrapped per item so each event's `extra`
+  dict additionally carries `batch_index` and `batch_total` (merged without
+  clobbering engine-supplied extras); the four core fields are unchanged. Single
+  (non-batch) calls pass the callback through untouched.
 - **`TranscriptionSession`** (ABC) — incremental, stateful transcription. Methods:
   `append(audio_bytes)`, `get_all_segments()`, `get_full_text()`,
   `get_session_info()`, `reset()`, `flush()`. Sessions consume raw mono s16le PCM
@@ -92,10 +122,18 @@ layers. Engine-specific data that doesn't fit the schema lives in
   with confidence-based filtering, deferring final segments until `flush()`.
 - **`RunPodJob` / `AsyncRunPodJob`** are the sync/async polling helpers that wrap
   a RunPod inference job and stream results back as they become available.
-  The RunPod stream protocol carries two kinds of items inside `data['stream']`:
-  `output` items (lists of segment dicts that are reconstructed into `Segment`
-  objects and yielded) and `progress` items (free-form dicts that are yielded
-  as `{"progress": ...}` and routed by the orchestrator to `on_progress`).
+  The RunPod stream protocol carries `output` entries inside `data['stream']`,
+  each tagged with a `type` (`segments`, `progress`, or `error`) and an optional
+  per-entry `index` used for batch demux. When `index` is absent (single-source
+  mode) the helper yields bare values for full back-compat — a bare `Segment`
+  for `segments`, a bare `{"progress": ...}` for `progress`, and a bare
+  `Exception` for `error` (so single-mode callers' existing raise path trips).
+  When `index` is present (batch mode) the same three kinds are yielded as
+  `(index, Segment)`, `{"progress": ..., "index": index}`, and
+  `(index, Exception)` respectively. The orchestrator (`_run_job_stream` /
+  `_run_job_stream_async`) normalizes both shapes into `(index, item)` and routes
+  progress to `on_progress`; per-index worker errors surface as
+  `(index, Exception)` without aborting the rest of the stream.
 - **`_copy_segment_extra_data`** is the shared helper that pulls all
   JSON-serializable, non-core attributes off backend-native segments into
   `Segment.extra_data`, so engine-specific metadata is preserved without
@@ -207,7 +245,24 @@ of a transcribe-then-diarize run.
    transcribes it (possibly streaming), normalizes results into `Segment`
    objects, and (if requested) calls `diarization.diarize()` to attach speaker
    labels.
-5. For incremental use cases, the caller instead does
+5. When a source argument is a list, the call enters the batch seam
+   (`_transcribe_batch` / `_transcribe_batch_async`). For local engines the
+   default seam fans out sequentially: each item is funneled through the same
+   single-file path (sync via `_transcribe_one`, async via
+   `_transcribe_one_async`) in input order, with results attributed by their
+   input index and per-item errors isolated rather than aborting the batch.
+   `RunPodModel` overrides the seam to collapse the whole list into **one**
+   remote job (a single payload whose `transcribe_args` source key is a list)
+   and demuxes the worker's index-tagged stream back into per-item results.
+   `RUNPOD_MAX_PAYLOAD_LEN` is enforced on the whole batched payload, raised
+   eagerly before submission: URL batches stay small and scale well, while
+   blob/path batches can exceed the cap and raise `ValueError` (aborting the
+   entire batch, since the cap is a property of the combined payload). Error
+   handling is deliberately asymmetric: a per-item worker error is isolated as
+   `(index, Exception)` (streaming) or `{"error": ...}` (non-streaming), whereas
+   a whole-job failure (network/queue `TimeoutError`, payload-too-large
+   `ValueError`) propagates from the batch call.
+6. For incremental use cases, the caller instead does
    `session = model.create_session(...)`, feeds raw PCM via `session.append`,
    and finalizes with `session.flush()`.
 

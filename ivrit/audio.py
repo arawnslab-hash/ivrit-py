@@ -166,15 +166,117 @@ class TranscriptionModel(ABC):
         """
         raise NotImplementedError(f"Session-based transcription is not supported for {self.engine} engine. "
                                 f"Only some specific models support sessions.")
-    
 
-    
+    def _normalize_sources(
+        self,
+        path: Optional[Union[str, List[str]]],
+        url: Optional[Union[str, List[str]]],
+        blob: Optional[Union[str, List[str]]],
+    ) -> tuple[str, List[str], bool]:
+        """
+        Validate and normalize the audio source arguments.
+
+        Exactly one of ``path`` / ``url`` / ``blob`` must be provided. Each may
+        be either a single string (single-file mode) or a list of strings
+        (batch mode). Centralizes the mutual-exclusivity and empty-list checks.
+
+        Args:
+            path: Path source (string or list of strings)
+            url: URL source (string or list of strings)
+            blob: Base64 blob source (string or list of strings)
+
+        Returns:
+            Tuple of (kind, items, is_batch) where kind is "path"|"url"|"blob",
+            items is the list of string sources, and is_batch is whether a list
+            was passed.
+
+        Raises:
+            ValueError: If multiple source kinds are provided, none is provided,
+                or a provided list is empty.
+        """
+        provided = [(kind, value) for kind, value in (("path", path), ("url", url), ("blob", blob)) if value is not None]
+        if len(provided) > 1:
+            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
+        if len(provided) == 0:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        kind, value = provided[0]
+        if isinstance(value, list):
+            if len(value) == 0:
+                raise ValueError(f"Empty source list provided for '{kind}'")
+            return kind, value, True
+        return kind, [value], False
+
+    def _build_result_dict(self, segments: List[Segment], language: Optional[str]) -> dict:
+        """
+        Build the single-file transcription result dictionary from segments.
+
+        Reproduces the empty-segments branch and the language resolution from
+        ``segments[0].extra_data`` exactly as the single-file path requires.
+
+        Args:
+            segments: List of transcription segments
+            language: Language code requested by the caller, if any
+
+        Returns:
+            Transcription result dictionary
+        """
+        if not segments:
+            return {
+                "text": "",
+                "segments": [],
+                "language": language or "unknown",
+                "engine": self.engine,
+                "model": self.model
+            }
+
+        # Combine all text
+        full_text = " ".join(segment.text for segment in segments)
+
+        return {
+            "text": full_text,
+            "segments": segments,
+            "language": segments[0].extra_data.get("language", language or "unknown"),
+            "engine": self.engine,
+            "model": self.model
+        }
+
+    def _wrap_progress(
+        self,
+        on_progress: Optional[ProgressCallback],
+        index: int,
+        total: int,
+    ) -> Optional[ProgressCallback]:
+        """
+        Wrap a progress callback to inject batch attribution into each event.
+
+        Merges ``batch_index`` / ``batch_total`` into the event's ``extra`` dict
+        without clobbering engine-supplied extras. Returns None when the user
+        did not supply a callback.
+
+        Args:
+            on_progress: The user-supplied progress callback, or None
+            index: The position of this item in the batch
+            total: The number of items in the batch
+
+        Returns:
+            A wrapped callback, or None if on_progress is None
+        """
+        if on_progress is None:
+            return None
+
+        def wrapped(event: Dict[str, Any]) -> None:
+            event["extra"] = {**(event.get("extra", {}) or {}), "batch_index": index, "batch_total": total}
+            on_progress(event)
+
+        return wrapped
+
     def transcribe(
         self,
         *,
-        path: Optional[str] = None,
-        url: Optional[str] = None,
-        blob: Optional[str] = None,
+        path: Optional[Union[str, List[str]]] = None,
+        url: Optional[Union[str, List[str]]] = None,
+        blob: Optional[Union[str, List[str]]] = None,
         language: Optional[str] = None,
         stream: bool = False,
         diarize: bool = False,
@@ -183,14 +285,22 @@ class TranscriptionModel(ABC):
         verbose: bool = False,
         on_progress: Optional[ProgressCallback] = None,
         **kwargs,
-    ) -> Union[dict, Generator]:
+    ) -> Union[dict, Generator, List[dict]]:
         """
         Transcribe audio using this model.
 
+        Each of path/url/blob accepts either a single string (single-file mode)
+        or a list of strings (batch mode). A list - even a one-element list -
+        selects batch mode and drives the return type. Batch items are processed
+        strictly sequentially with per-item error isolation.
+
         Args:
-            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
-            url: URL to download and transcribe (mutually exclusive with path and blob)
-            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            path: Path(s) to the audio file to transcribe; string or list of strings
+                (mutually exclusive with url and blob)
+            url: URL(s) to download and transcribe; string or list of strings
+                (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe; string or list of strings
+                (mutually exclusive with path and url)
             language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
             stream: Whether to return results as a generator (True) or full result (False)
             diarize: Whether to enable speaker diarization
@@ -218,30 +328,189 @@ class TranscriptionModel(ABC):
                 warning level.
             **kwargs: Additional keyword arguments for the transcription model.
         Returns:
-            If stream=True: Generator yielding transcription segments
-            If stream=False: Complete transcription result as dictionary
-            
+            Single-file mode (bare string source):
+                If stream=True: Generator yielding transcription segments
+                If stream=False: Complete transcription result as dictionary
+            Batch mode (list source):
+                If stream=True: Generator yielding (index, Segment) tuples, or
+                    (index, Exception) on per-item failure
+                If stream=False: List[dict], one entry per input in input order;
+                    a failed item is {"error": str, "source": kind, "input": value}
+
         Raises:
-            ValueError: If multiple input sources are provided, or none is provided
+            ValueError: If multiple input sources are provided, none is provided,
+                an empty list is provided, or stream=True with diarize=True
             FileNotFoundError: If the specified path doesn't exist
             Exception: For other transcription errors
         """
-        # Validate arguments
-        provided_args = [arg for arg in [path, url, blob] if arg is not None]
-        if len(provided_args) > 1:
-            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
-        
-        if len(provided_args) == 0:
-            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+        # Validate sources eagerly (before returning any generator) so misuse
+        # errors propagate from the call itself.
+        kind, items, is_batch = self._normalize_sources(path, url, blob)
 
-        # Validate streaming with diarization
+        # Validate streaming with diarization eagerly. This is a misuse error,
+        # not a per-item data error, so it must surface immediately.
         if stream and diarize:
             raise ValueError("Streaming (stream=True) is not compatible with diarization (diarize=True). Diarization requires processing all segments before speaker assignment.")
 
+        if not is_batch:
+            return self._transcribe_one(
+                **{kind: items[0]},
+                language=language,
+                stream=stream,
+                diarize=diarize,
+                diarization_args=diarization_args,
+                output_options=output_options,
+                verbose=verbose,
+                on_progress=on_progress,
+                **kwargs,
+            )
+
+        return self._transcribe_batch(
+            kind=kind,
+            items=items,
+            language=language,
+            stream=stream,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            on_progress=on_progress,
+            **kwargs,
+        )
+
+    def _transcribe_batch(
+        self,
+        *,
+        kind: str,
+        items: List[str],
+        language: Optional[str] = None,
+        stream: bool = False,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Union[Generator, List[dict]]:
+        """
+        Overridable batch seam for synchronous transcription.
+
+        The default implementation fans each item out through the single-source
+        ``_transcribe_one`` path in input order, with per-item error isolation
+        and per-item progress attribution via ``_wrap_progress``. Subclasses
+        (e.g. RunPod) override this to submit a single batched job instead.
+
+        Source normalization/validation is owned by ``transcribe``; this method
+        receives already-normalized ``kind`` / ``items``.
+
+        Returns a ``Generator[Tuple[int, Union[Segment, Exception]]]`` when
+        ``stream`` is True, else a ``List[dict]`` in input order.
+        """
+        total = len(items)
+
+        if stream:
+            def batch_generator():
+                for i, item in enumerate(items):
+                    try:
+                        generator = self._transcribe_one(
+                            **{kind: item},
+                            language=language,
+                            stream=True,
+                            diarize=diarize,
+                            diarization_args=diarization_args,
+                            output_options=output_options,
+                            verbose=verbose,
+                            on_progress=self._wrap_progress(on_progress, i, total),
+                            **kwargs,
+                        )
+                        for segment in generator:
+                            yield (i, segment)
+                    except Exception as exc:
+                        yield (i, exc)
+            return batch_generator()
+
+        results: List[dict] = []
+        for i, item in enumerate(items):
+            try:
+                results.append(self._transcribe_one(
+                    **{kind: item},
+                    language=language,
+                    stream=False,
+                    diarize=diarize,
+                    diarization_args=diarization_args,
+                    output_options=output_options,
+                    verbose=verbose,
+                    on_progress=self._wrap_progress(on_progress, i, total),
+                    **kwargs,
+                ))
+            except Exception as exc:
+                results.append({"error": str(exc), "source": kind, "input": item})
+        return results
+
+    async def _transcribe_batch_async(
+        self,
+        *,
+        kind: str,
+        items: List[str],
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> AsyncGenerator[tuple[int, Union[Segment, Exception]], None]:
+        """
+        Overridable batch seam for asynchronous transcription (always streams).
+
+        The default implementation fans each item out through the single-source
+        ``_transcribe_one_async`` path in input order, with per-item error
+        isolation and per-item progress attribution. Subclasses (e.g. RunPod)
+        override this to submit a single batched job instead.
+
+        Source normalization/validation is owned by ``transcribe_async``; this
+        method receives already-normalized ``kind`` / ``items``.
+        """
+        total = len(items)
+        for i, item in enumerate(items):
+            try:
+                async for segment in self._transcribe_one_async(
+                    **{kind: item},
+                    language=language,
+                    diarize=diarize,
+                    diarization_args=diarization_args,
+                    output_options=output_options,
+                    verbose=verbose,
+                    on_progress=self._wrap_progress(on_progress, i, total),
+                    **kwargs,
+                ):
+                    yield (i, segment)
+            except Exception as exc:
+                yield (i, exc)
+
+    def _transcribe_one(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        stream: bool = False,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Union[dict, Generator]:
+        """
+        Transcribe a single audio source. This is the single-file core path used
+        by both single and batch calls. See ``transcribe`` for argument details.
+        """
         # Default output options if not provided
         if output_options is None:
             output_options = {}
-        
+
         # Set defaults for output options
         output_options = {
             'word_timestamps': output_options.get('word_timestamps', True),
@@ -250,35 +519,15 @@ class TranscriptionModel(ABC):
 
         # Get streaming results from the model
         segments_generator = self.transcribe_core(path=path, url=url, blob=blob, language=language, diarize=diarize, diarization_args=diarization_args, output_options=output_options, verbose=verbose, on_progress=on_progress, **kwargs)
-        
+
         if stream:
             # Return generator directly
             return segments_generator
         else:
             # Collect all segments and return as dictionary
             segments = list(segments_generator)
-            if not segments:
-                return {
-                    "text": "",
-                    "segments": [],
-                    "language": language or "unknown",
-                    "engine": self.engine,
-                    "model": self.model
-                }
-            
-            # Combine all text
-            full_text = " ".join(segment.text for segment in segments)
-            
-            transcription_results = {
-                "text": full_text,
-                "segments": segments,
-                "language": segments[0].extra_data.get("language", language or "unknown"),
-                "engine": self.engine,
-                "model": self.model
-            }
+            return self._build_result_dict(segments, language)
 
-            return transcription_results
-    
     @abstractmethod
     def transcribe_core(
         self,
@@ -316,9 +565,9 @@ class TranscriptionModel(ABC):
     async def transcribe_async(
         self,
         *,
-        path: Optional[str] = None,
-        url: Optional[str] = None,
-        blob: Optional[str] = None,
+        path: Optional[Union[str, List[str]]] = None,
+        url: Optional[Union[str, List[str]]] = None,
+        blob: Optional[Union[str, List[str]]] = None,
         language: Optional[str] = None,
         diarize: bool = False,
         diarization_args: Optional[Dict[str, Any]] = None,
@@ -326,16 +575,25 @@ class TranscriptionModel(ABC):
         verbose: bool = False,
         on_progress: Optional[ProgressCallback] = None,
         **kwargs,
-    ) -> AsyncGenerator[Segment, None]:
+    ) -> AsyncGenerator[tuple[int, Union[Segment, Exception]], None]:
         """
         Transcribe audio using this model asynchronously.
 
-        Runs the transcription in a thread pool to allow other coroutines to continue.
+        Each of path/url/blob accepts either a single string (single-file mode)
+        or a list of strings (batch mode). Async transcription always streams.
+
+        Single-file mode yields Segment objects. Batch mode yields
+        (index, Segment) tuples, or a single (index, Exception) on per-item
+        failure before continuing to the next item. Batch items are processed
+        strictly sequentially in input order.
 
         Args:
-            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
-            url: URL to download and transcribe (mutually exclusive with path and blob)
-            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            path: Path(s) to the audio file to transcribe; string or list of strings
+                (mutually exclusive with url and blob)
+            url: URL(s) to download and transcribe; string or list of strings
+                (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe; string or list of strings
+                (mutually exclusive with path and url)
             language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
             diarize: Whether to enable speaker diarization
             diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
@@ -348,25 +606,80 @@ class TranscriptionModel(ABC):
                 thread (default async impl), it must be thread-safe.
             **kwargs: Additional keyword arguments for the transcription model.
         Returns:
-            AsyncGenerator yielding transcription segments
-            
+            Single-file mode: AsyncGenerator yielding Segment objects
+            Batch mode: AsyncGenerator yielding (index, Segment) / (index, Exception)
+
         Raises:
-            ValueError: If multiple input sources are provided, or none is provided
+            ValueError: If multiple input sources are provided, none is provided,
+                or an empty list is provided
             FileNotFoundError: If the specified path doesn't exist
             Exception: For other transcription errors
+        """
+        # Validate sources eagerly (before entering the generator body) so
+        # misuse errors propagate from the call itself.
+        kind, items, is_batch = self._normalize_sources(path, url, blob)
+
+        if not is_batch:
+            async for segment in self._transcribe_one_async(
+                **{kind: items[0]},
+                language=language,
+                diarize=diarize,
+                diarization_args=diarization_args,
+                output_options=output_options,
+                verbose=verbose,
+                on_progress=on_progress,
+                **kwargs,
+            ):
+                yield segment
+            return
+
+        async for x in self._transcribe_batch_async(
+            kind=kind,
+            items=items,
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            on_progress=on_progress,
+            **kwargs,
+        ):
+            yield x
+
+    async def _transcribe_one_async(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> AsyncGenerator[Segment, None]:
+        """
+        Transcribe a single audio source asynchronously.
+
+        Runs the transcription in a thread pool to allow other coroutines to
+        continue. This is the single-source async seam; subclasses (e.g. RunPod)
+        may override it with a native async implementation. See
+        ``transcribe_async`` for argument details.
         """
         # Validate arguments
         provided_args = [arg for arg in [path, url, blob] if arg is not None]
         if len(provided_args) > 1:
             raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
-        
+
         if len(provided_args) == 0:
             raise ValueError("Must specify either 'path', 'url', or 'blob'")
 
         # Default output options if not provided
         if output_options is None:
             output_options = {}
-        
+
         # Set defaults for output options
         output_options = {
             'word_timestamps': output_options.get('word_timestamps', True),
@@ -381,11 +694,11 @@ class TranscriptionModel(ABC):
                 output_options=output_options, verbose=verbose,
                 on_progress=on_progress, **kwargs
             ))
-        
+
         # Run transcription in thread pool to allow other coroutines to continue
         loop = asyncio.get_event_loop()
         segments = await loop.run_in_executor(None, run_transcription)
-        
+
         # Yield segments
         for segment in segments:
             yield segment
@@ -1286,17 +1599,26 @@ class RunPodJob:
                 for item in data['stream']:
                     if 'output' in item:
                         for entry in item['output']:
-                            if entry['type'] == 'segments':
+                            index = entry.get('index')
+                            entry_type = entry.get('type')
+                            if entry_type == 'segments':
                                 for element in entry['data']:
                                     try:
-                                        yield Segment(**element)
-                                        yielded_segments += 1
+                                        segment = Segment(**element)
                                     except Exception as e:
                                         logger.error(f"Failed to decode RunPod stream element: {e}")
                                         raise Exception(f"Failed to decode JSON: {e}")
-                            elif entry['type'] == 'progress':
-                                yield {"progress": entry['data']}
+                                    yield segment if index is None else (index, segment)
+                                    yielded_segments += 1
+                            elif entry_type == 'progress':
+                                if index is None:
+                                    yield {"progress": entry['data']}
+                                else:
+                                    yield {"progress": entry['data'], "index": index}
                                 yielded_progress += 1
+                            elif entry_type == 'error':
+                                exc = Exception(entry['data'])
+                                yield exc if index is None else (index, exc)
 
                 logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} yielded segments={yielded_segments} progress={yielded_progress}")
 
@@ -1399,15 +1721,24 @@ class AsyncRunPodJob:
                         for item in data['stream']:
                             if 'output' in item:
                                 for entry in item['output']:
-                                    if entry['type'] == 'segments':
+                                    index = entry.get('index')
+                                    entry_type = entry.get('type')
+                                    if entry_type == 'segments':
                                         for element in entry['data']:
                                             try:
-                                                yield Segment(**element)
+                                                segment = Segment(**element)
                                             except Exception as e:
                                                 logger.error(f"Failed to decode RunPod async stream element: {e}")
                                                 raise Exception(f"Failed to decode JSON: {e}")
-                                    elif entry['type'] == 'progress':
-                                        yield {"progress": entry['data']}
+                                            yield segment if index is None else (index, segment)
+                                    elif entry_type == 'progress':
+                                        if index is None:
+                                            yield {"progress": entry['data']}
+                                        else:
+                                            yield {"progress": entry['data'], "index": index}
+                                    elif entry_type == 'error':
+                                        exc = Exception(entry['data'])
+                                        yield exc if index is None else (index, exc)
 
                         if data['status'] == 'COMPLETED':
                             return
@@ -1493,47 +1824,66 @@ class RunPodModel(TranscriptionModel):
         
         return session
 
-    def transcribe_core(
+    def _build_payload(
         self,
         *,
-        path: Optional[str] = None,
-        url: Optional[str] = None,
-        blob: Optional[str] = None,
-        language: Optional[str] = None,
-        diarize: bool = False,
-        diarization_args: Optional[Dict[str, Any]] = None,
+        kind: str,
+        source: Union[str, List[str]],
+        language: Optional[str],
+        diarize: bool,
+        diarization_args: Optional[Dict[str, Any]],
         output_options: Dict[str, Any],
-        verbose: bool = False,
-        on_progress: Optional[ProgressCallback] = None,
+        verbose: bool,
         **kwargs,
-    ) -> Generator[Segment, None, None]:
+    ) -> dict:
         """
-        Transcribe using RunPod engine.
-        """
-        # Validate diarization support
-        if diarize and self.core_engine != "stable-whisper":
-            raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
-                                    f"Current core_engine is '{self.core_engine}'.")
+        Build the RunPod job payload for either a single source or a list of
+        sources.
 
-        # Determine payload type and data
-        if path is not None:
+        ``source`` is a single string (single-source mode) or a list of strings
+        (batch mode). The list-ness of ``source`` is preserved into the
+        ``transcribe_args`` source key (``url`` / ``blob``), so the worker
+        receives one value or a list. For ``kind="path"`` each element is read
+        and base64-encoded into a blob; for url/blob it is passed through. The
+        scalar top-level ``type`` field ("blob"/"url") is unaffected by
+        list-ness.
+
+        The combined payload length is enforced against RUNPOD_MAX_PAYLOAD_LEN
+        before returning; this aborts a batch eagerly when the aggregate payload
+        exceeds the cap.
+        """
+        is_list = isinstance(source, list)
+
+        if kind == "path" or kind == "blob":
             payload_type = "blob"
-            data_source = path
-        elif url is not None:
+            source_key = "blob"
+        elif kind == "url":
             payload_type = "url"
-            data_source = url
-        elif blob is not None:
-            payload_type = "blob"
-            data_source = blob
+            source_key = "url"
         else:
             raise ValueError("Must specify either 'path', 'url', or 'blob'")
-        
+
         if verbose:
             logger.info(f"Using RunPod engine with model: {self.model}")
             logger.info(f"Payload type: {payload_type}")
-            logger.info(f"Data source: {data_source}")
-        
-        # Prepare payload
+            logger.info(f"Data source: {source}")
+
+        def encode_element(element: str) -> str:
+            if kind == "path":
+                try:
+                    with open(element, 'rb') as f:
+                        audio_data = f.read()
+                    return base64.b64encode(audio_data).decode('utf-8')
+                except Exception as e:
+                    logger.error(f"Failed to read audio file for RunPod: {e}")
+                    raise Exception(f"Failed to read audio file: {e}")
+            return element
+
+        if is_list:
+            source_value = [encode_element(element) for element in source]
+        else:
+            source_value = encode_element(source)
+
         payload = {
             "input": {
                 "type": payload_type,
@@ -1546,39 +1896,35 @@ class RunPodModel(TranscriptionModel):
                     "diarization_args": diarization_args,
                     "output_options": output_options,
                     "verbose": verbose,
+                    source_key: source_value,
                     **kwargs
                 }
             }
         }
-        
-        if payload_type == "blob":
-            if path is not None:
-                # Read audio file and encode as base64
-                try:
-                    with open(data_source, 'rb') as f:
-                        audio_data = f.read()
-                    payload["input"]["transcribe_args"]["blob"] = base64.b64encode(audio_data).decode('utf-8')
-                except Exception as e:
-                    logger.error(f"Failed to read audio file for RunPod: {e}")
-                    raise Exception(f"Failed to read audio file: {e}")
-            else:
-                # Use blob data directly
-                payload["input"]["transcribe_args"]["blob"] = data_source
-        else:
-            payload["input"]["transcribe_args"]["url"] = data_source
 
-        # Check payload size
+        # Check payload size on the whole (possibly batched) payload.
         if len(str(payload)) > self.RUNPOD_MAX_PAYLOAD_LEN:
-            logger.error(f"RunPod payload too large: {len(str(payload))} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
-            raise ValueError(f"Payload length is {len(str(payload))}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
+            scope = "batched payload" if is_list else "payload"
+            logger.error(f"RunPod {scope} too large: {len(str(payload))} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
+            raise ValueError(f"{scope.capitalize()} length is {len(str(payload))}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
 
+        return payload
+
+    def _run_job_stream(self, payload, on_progress):
+        """
+        Submit a RunPod job and stream its results, demultiplexing the worker
+        stream into ``(index, Segment)`` and ``(index, {"progress": ...})``
+        tuples where ``index`` is None in single-source mode.
+
+        Preserves the queue-wait, timeout/retry, cancel, billing and finally
+        semantics of the original inline implementation. Per-item worker errors
+        (tagged ``error`` entries) surface as ``(index, Exception)`` without
+        aborting the rest of the stream; an untagged error surfaces as a bare
+        Exception (single-source back-compat).
+        """
         # Create and execute RunPod job
         run_request = RunPodJob(self.api_key, self.endpoint_id, payload)
-        
-        # Wait for task to be queued
-        if verbose:
-            logger.info("Waiting for task to be queued...")
-        
+
         status = None
         for i in range(self.IN_QUEUE_TIMEOUT):
             status = run_request.status()
@@ -1594,8 +1940,6 @@ class RunPodModel(TranscriptionModel):
                 time.sleep(1)
                 continue
             break
-        if verbose:
-            logger.info(f"Task status: {status}")
 
         if status == "IN_QUEUE":
             emit_progress(
@@ -1626,32 +1970,27 @@ class RunPodModel(TranscriptionModel):
         job_id = run_request.job_id
         while True:
             loop_iter += 1
-            logger.debug(f"transcribe_core[{job_id}]: stream loop iter={loop_iter} timeouts={timeouts}")
+            logger.debug(f"_run_job_stream[{job_id}]: stream loop iter={loop_iter} timeouts={timeouts}")
             try:
                 seg_count = 0
                 prog_count = 0
                 for stream_item in run_request.stream():
-                    if isinstance(stream_item, Segment):
+                    index, item = self._demux_stream_item(stream_item)
+                    if isinstance(item, Segment):
                         seg_count += 1
-                        yield stream_item
-                    elif isinstance(stream_item, dict) and "progress" in stream_item:
-                        # Worker-emitted progress dict; pass through
-                        # unchanged. The worker is responsible for following
-                        # the on_progress contract; we only log a warning if
-                        # the dict obviously violates it (no 'phase').
-                        worker_progress = stream_item["progress"]
-                        if "phase" not in worker_progress:
-                            logger.warning(
-                                "RunPod worker progress event missing 'phase' key: %s",
-                                worker_progress,
-                            )
-                        invoke_progress(on_progress, worker_progress)
+                        yield (index, item)
+                    elif isinstance(item, dict) and "progress" in item:
                         prog_count += 1
+                        yield (index, item)
+                    elif isinstance(item, Exception):
+                        if index is None:
+                            raise Exception(f"RunPod error: {item}")
+                        yield (index, item)
                     else:
                         raise Exception(f"RunPod error: {stream_item}")
 
                 # If we get here, streaming is complete
-                logger.debug(f"transcribe_core[{job_id}]: stream() returned cleanly iter={loop_iter} segments={seg_count} progress={prog_count}")
+                logger.debug(f"_run_job_stream[{job_id}]: stream() returned cleanly iter={loop_iter} segments={seg_count} progress={prog_count}")
 
                 # Log RunPod billing timings (authoritative — same fields RunPod bills on)
                 try:
@@ -1683,7 +2022,33 @@ class RunPodModel(TranscriptionModel):
                 if run_request:
                     run_request.cancel()
 
-    async def transcribe_async(
+    @staticmethod
+    def _demux_stream_item(stream_item):
+        """
+        Split a stream item into ``(index, item)`` where ``index`` is None for
+        untagged (single-source) items and an int for batch-tagged items.
+        Untagged items arrive as bare ``Segment`` / ``{"progress": ...}`` /
+        ``Exception``; tagged items arrive as ``(index, value)`` tuples (the
+        progress dict additionally carries an ``"index"`` key).
+        """
+        if isinstance(stream_item, tuple):
+            return stream_item[0], stream_item[1]
+        if isinstance(stream_item, dict) and "index" in stream_item:
+            index = stream_item["index"]
+            return index, {"progress": stream_item["progress"]}
+        return None, stream_item
+
+    def _emit_worker_progress(self, on_progress, worker_progress):
+        """Forward a worker-emitted progress dict to on_progress, warning on a
+        missing 'phase' key (the worker owns the on_progress contract)."""
+        if "phase" not in worker_progress:
+            logger.warning(
+                "RunPod worker progress event missing 'phase' key: %s",
+                worker_progress,
+            )
+        invoke_progress(on_progress, worker_progress)
+
+    def transcribe_core(
         self,
         *,
         path: Optional[str] = None,
@@ -1692,128 +2057,138 @@ class RunPodModel(TranscriptionModel):
         language: Optional[str] = None,
         diarize: bool = False,
         diarization_args: Optional[Dict[str, Any]] = None,
-        output_options: Optional[Dict[str, Any]] = None,
+        output_options: Dict[str, Any],
         verbose: bool = False,
         on_progress: Optional[ProgressCallback] = None,
         **kwargs,
-    ) -> AsyncGenerator[Segment, None]:
+    ) -> Generator[Segment, None, None]:
         """
-        Transcribe audio using RunPod asynchronously with native async I/O.
-
-        This specialized implementation uses aiohttp for better scalability
-        when handling many concurrent requests, avoiding thread pool exhaustion.
-
-        Args:
-            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
-            url: URL to download and transcribe (mutually exclusive with path and blob)
-            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
-            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
-            diarize: Whether to enable speaker diarization
-            diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
-            output_options: Dictionary controlling output verbosity. Supported keys:
-                - word_timestamps (bool): Whether to populate word-level timestamps (default: True)
-                - extra_data (bool): Whether to populate extra metadata fields (default: True)
-            verbose: Whether to enable verbose output
-            on_progress: Optional progress callback. See TranscriptionModel.transcribe.
-            **kwargs: Additional keyword arguments for the transcription model.
-        Returns:
-            AsyncGenerator yielding transcription segments
-            
-        Raises:
-            ValueError: If multiple input sources are provided, or none is provided
-            FileNotFoundError: If the specified path doesn't exist
-            Exception: For other transcription errors
+        Transcribe a single source using RunPod engine.
         """
         # Validate diarization support
         if diarize and self.core_engine != "stable-whisper":
             raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
                                     f"Current core_engine is '{self.core_engine}'.")
-        
-        # Validate arguments
-        provided_args = [arg for arg in [path, url, blob] if arg is not None]
-        if len(provided_args) > 1:
-            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
-        
-        if len(provided_args) == 0:
+
+        # Determine source kind and scalar value
+        if path is not None:
+            kind, source = "path", path
+        elif url is not None:
+            kind, source = "url", url
+        elif blob is not None:
+            kind, source = "blob", blob
+        else:
             raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        payload = self._build_payload(
+            kind=kind,
+            source=source,
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        for index, item in self._run_job_stream(payload, on_progress):
+            if isinstance(item, Segment):
+                yield item
+            elif isinstance(item, dict) and "progress" in item:
+                self._emit_worker_progress(on_progress, item["progress"])
+
+    def _transcribe_batch(
+        self,
+        *,
+        kind: str,
+        items: List[str],
+        language: Optional[str] = None,
+        stream: bool = False,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> Union[Generator, List[dict]]:
+        """
+        RunPod batch override: submit ONE job with a list payload and demux the
+        index-tagged stream, rather than fanning out one job per item.
+        """
+        # Validate diarization support
+        if diarize and self.core_engine != "stable-whisper":
+            raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
+                                    f"Current core_engine is '{self.core_engine}'.")
 
         # Default output options if not provided
         if output_options is None:
             output_options = {}
-        
-        # Set defaults for output options
         output_options = {
             'word_timestamps': output_options.get('word_timestamps', True),
             'extra_data': output_options.get('extra_data', True),
         }
 
-        # Determine payload type and data
-        if path is not None:
-            payload_type = "blob"
-            data_source = path
-        elif url is not None:
-            payload_type = "url"
-            data_source = url
-        elif blob is not None:
-            payload_type = "blob"
-            data_source = blob
-        else:
-            raise ValueError("Must specify either 'path', 'url', or 'blob'")
-        
-        if verbose:
-            logger.info(f"Using RunPod engine with model: {self.model}")
-            logger.info(f"Payload type: {payload_type}")
-            logger.info(f"Data source: {data_source}")
-        
-        # Prepare payload
-        payload = {
-            "input": {
-                "type": payload_type,
-                "model": self.model,
-                "engine": self.core_engine,
-                "streaming": True,
-                "transcribe_args": {
-                    "language": language,
-                    "diarize": diarize,
-                    "diarization_args": diarization_args,
-                    "output_options": output_options,
-                    "verbose": verbose,
-                    **kwargs
-                }
-            }
-        }
-        
-        if payload_type == "blob":
-            if path is not None:
-                # Read audio file and encode as base64
-                try:
-                    with open(data_source, 'rb') as f:
-                        audio_data = f.read()
-                    payload["input"]["transcribe_args"]["blob"] = base64.b64encode(audio_data).decode('utf-8')
-                except Exception as e:
-                    logger.error(f"Failed to read audio file for RunPod async: {e}")
-                    raise Exception(f"Failed to read audio file: {e}")
+        total = len(items)
+
+        # Build the single batched payload eagerly (payload cap enforced inside).
+        payload = self._build_payload(
+            kind=kind,
+            source=items,
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        if stream:
+            def batch_generator():
+                for index, item in self._run_job_stream(payload, on_progress):
+                    if isinstance(item, Segment):
+                        yield (index, item)
+                    elif isinstance(item, dict) and "progress" in item:
+                        wrapped = self._wrap_progress(on_progress, index, total)
+                        self._emit_worker_progress(wrapped, item["progress"])
+                    elif isinstance(item, Exception):
+                        yield (index, item)
+            return batch_generator()
+
+        # Non-streaming: stream under the hood and collect into List[dict] in
+        # input order.
+        segments_by_index: Dict[int, List[Segment]] = {i: [] for i in range(total)}
+        error_by_index: Dict[int, Exception] = {}
+        for index, item in self._run_job_stream(payload, on_progress):
+            if isinstance(item, Segment):
+                segments_by_index[index].append(item)
+            elif isinstance(item, dict) and "progress" in item:
+                wrapped = self._wrap_progress(on_progress, index, total)
+                self._emit_worker_progress(wrapped, item["progress"])
+            elif isinstance(item, Exception):
+                error_by_index[index] = item
+
+        results: List[dict] = []
+        for i in range(total):
+            if i in error_by_index:
+                results.append({"error": str(error_by_index[i]), "source": kind, "input": items[i]})
             else:
-                # Use blob data directly
-                payload["input"]["transcribe_args"]["blob"] = data_source
-        else:
-            payload["input"]["transcribe_args"]["url"] = data_source
+                results.append(self._build_result_dict(segments_by_index[i], language))
+        return results
 
-        # Check payload size
-        if len(str(payload)) > self.RUNPOD_MAX_PAYLOAD_LEN:
-            logger.error(f"RunPod payload too large: {len(str(payload))} bytes (max {self.RUNPOD_MAX_PAYLOAD_LEN})")
-            raise ValueError(f"Payload length is {len(str(payload))}, exceeding max payload length of {self.RUNPOD_MAX_PAYLOAD_LEN}")
-
+    async def _run_job_stream_async(self, payload, on_progress):
+        """
+        Async variant of ``_run_job_stream``: submit a RunPod job over native
+        aiohttp and stream its results, demultiplexing into ``(index, Segment)``
+        and ``(index, {"progress": ...})`` tuples where ``index`` is None in
+        single-source mode. Preserves the queue-wait, timeout/retry, cancel,
+        billing and finally semantics of the original inline implementation.
+        """
         # Create and execute RunPod job using native async
         run_request = AsyncRunPodJob(self.api_key, self.endpoint_id, payload)
-        
+
         # Submit the job
         await run_request.submit()
-        
-        # Wait for task to be queued
-        if verbose:
-            logger.info("Waiting for task to be queued...")
-        
+
         status = None
         for i in range(self.IN_QUEUE_TIMEOUT):
             status = await run_request.status()
@@ -1829,8 +2204,6 @@ class RunPodModel(TranscriptionModel):
                 await asyncio.sleep(1)
                 continue
             break
-        if verbose:
-            logger.info(f"Task status: {status}")
 
         if status == "IN_QUEUE":
             emit_progress(
@@ -1860,20 +2233,15 @@ class RunPodModel(TranscriptionModel):
         while True:
             try:
                 async for stream_item in run_request.stream():
-                    if isinstance(stream_item, Segment):
-                        yield stream_item
-                    elif isinstance(stream_item, dict) and "progress" in stream_item:
-                        # Worker-emitted progress dict; pass through
-                        # unchanged. The worker is responsible for following
-                        # the on_progress contract; we only log a warning if
-                        # the dict obviously violates it (no 'phase').
-                        worker_progress = stream_item["progress"]
-                        if "phase" not in worker_progress:
-                            logger.warning(
-                                "RunPod worker progress event missing 'phase' key: %s",
-                                worker_progress,
-                            )
-                        invoke_progress(on_progress, worker_progress)
+                    index, item = self._demux_stream_item(stream_item)
+                    if isinstance(item, Segment):
+                        yield (index, item)
+                    elif isinstance(item, dict) and "progress" in item:
+                        yield (index, item)
+                    elif isinstance(item, Exception):
+                        if index is None:
+                            raise Exception(f"RunPod error: {item}")
+                        yield (index, item)
                     else:
                         raise Exception(f"RunPod error: {stream_item}")
 
@@ -1906,6 +2274,151 @@ class RunPodModel(TranscriptionModel):
             finally:
                 if run_request:
                     await run_request.cancel()
+
+    async def _transcribe_one_async(
+        self,
+        *,
+        path: Optional[str] = None,
+        url: Optional[str] = None,
+        blob: Optional[str] = None,
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> AsyncGenerator[Segment, None]:
+        """
+        Transcribe a single audio source using RunPod asynchronously with native async I/O.
+
+        This is the RunPod override of the single-source async seam.
+
+        This specialized implementation uses aiohttp for better scalability
+        when handling many concurrent requests, avoiding thread pool exhaustion.
+
+        Args:
+            path: Path to the audio file to transcribe (mutually exclusive with url and blob)
+            url: URL to download and transcribe (mutually exclusive with path and blob)
+            blob: Base64 encoded blob data to transcribe (mutually exclusive with path and url)
+            language: Language code for transcription (e.g., 'he' for Hebrew, 'en' for English)
+            diarize: Whether to enable speaker diarization
+            diarization_args: Dictionary of arguments for diarization (engine, device, num_speakers, etc.)
+            output_options: Dictionary controlling output verbosity. Supported keys:
+                - word_timestamps (bool): Whether to populate word-level timestamps (default: True)
+                - extra_data (bool): Whether to populate extra metadata fields (default: True)
+            verbose: Whether to enable verbose output
+            on_progress: Optional progress callback. See TranscriptionModel.transcribe.
+            **kwargs: Additional keyword arguments for the transcription model.
+        Returns:
+            AsyncGenerator yielding transcription segments
+
+        Raises:
+            ValueError: If multiple input sources are provided, or none is provided
+            FileNotFoundError: If the specified path doesn't exist
+            Exception: For other transcription errors
+        """
+        # Validate diarization support
+        if diarize and self.core_engine != "stable-whisper":
+            raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
+                                    f"Current core_engine is '{self.core_engine}'.")
+
+        # Validate arguments
+        provided_args = [arg for arg in [path, url, blob] if arg is not None]
+        if len(provided_args) > 1:
+            raise ValueError("Cannot specify multiple input sources - path, url, and blob are mutually exclusive")
+
+        if len(provided_args) == 0:
+            raise ValueError("Must specify either 'path', 'url', or 'blob'")
+
+        # Default output options if not provided
+        if output_options is None:
+            output_options = {}
+
+        # Set defaults for output options
+        output_options = {
+            'word_timestamps': output_options.get('word_timestamps', True),
+            'extra_data': output_options.get('extra_data', True),
+        }
+
+        # Determine source kind and scalar value
+        if path is not None:
+            kind, source = "path", path
+        elif url is not None:
+            kind, source = "url", url
+        else:
+            kind, source = "blob", blob
+
+        payload = self._build_payload(
+            kind=kind,
+            source=source,
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        async for index, item in self._run_job_stream_async(payload, on_progress):
+            if isinstance(item, Segment):
+                yield item
+            elif isinstance(item, dict) and "progress" in item:
+                self._emit_worker_progress(on_progress, item["progress"])
+
+    async def _transcribe_batch_async(
+        self,
+        *,
+        kind: str,
+        items: List[str],
+        language: Optional[str] = None,
+        diarize: bool = False,
+        diarization_args: Optional[Dict[str, Any]] = None,
+        output_options: Optional[Dict[str, Any]] = None,
+        verbose: bool = False,
+        on_progress: Optional[ProgressCallback] = None,
+        **kwargs,
+    ) -> AsyncGenerator[tuple[int, Union[Segment, Exception]], None]:
+        """
+        RunPod async batch override: submit ONE job with a list payload and
+        demux the index-tagged stream, yielding ``(index, Segment)`` and routing
+        per-index progress to a wrapped callback. Per-index worker errors surface
+        as ``(index, Exception)`` without aborting the rest of the stream.
+        """
+        # Validate diarization support
+        if diarize and self.core_engine != "stable-whisper":
+            raise NotImplementedError("Diarization (diarize=True) is only supported with core_engine='stable-whisper'. "
+                                    f"Current core_engine is '{self.core_engine}'.")
+
+        # Default output options if not provided
+        if output_options is None:
+            output_options = {}
+        output_options = {
+            'word_timestamps': output_options.get('word_timestamps', True),
+            'extra_data': output_options.get('extra_data', True),
+        }
+
+        total = len(items)
+
+        payload = self._build_payload(
+            kind=kind,
+            source=items,
+            language=language,
+            diarize=diarize,
+            diarization_args=diarization_args,
+            output_options=output_options,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        async for index, item in self._run_job_stream_async(payload, on_progress):
+            if isinstance(item, Segment):
+                yield (index, item)
+            elif isinstance(item, dict) and "progress" in item:
+                wrapped = self._wrap_progress(on_progress, index, total)
+                self._emit_worker_progress(wrapped, item["progress"])
+            elif isinstance(item, Exception):
+                yield (index, item)
 
 
 def load_model(
