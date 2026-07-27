@@ -139,6 +139,14 @@ layers. Engine-specific data that doesn't fit the schema lives in
   `_run_job_stream_async`) normalizes both shapes into `(index, item)` and routes
   progress to `on_progress`; per-index worker errors surface as
   `(index, Exception)` without aborting the rest of the stream.
+  RunPod's `/stream` endpoint reports `COMPLETED` even for jobs that have failed,
+  and for jobs that have not started yet, so its status field is never taken as
+  the job's outcome. Whenever a `/stream` response carries no further data the
+  helpers confirm the real outcome through `status_body()` (`/status`, the only
+  place RunPod reports a failure's `error`): a still-running job means streaming
+  continues, a failed one raises carrying that error. Without this a failed job —
+  a bad model name, say — ends the stream silently and is indistinguishable from
+  a successful transcription of a silent recording.
 - **`_copy_segment_extra_data`** is the shared helper that pulls all
   JSON-serializable, non-core attributes off backend-native segments into
   `Segment.extra_data`, so engine-specific metadata is preserved without

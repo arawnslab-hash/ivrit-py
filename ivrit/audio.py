@@ -1548,8 +1548,8 @@ class RunPodJob:
         self.job_id = result.get("id")
         logger.debug(f"RunPodJob[{self.job_id}]: submitted")
 
-    def status(self):
-        """Get job status"""
+    def status_body(self):
+        """Fetch /status. A failed job's error is reported here and nowhere else."""
         logger.debug(f"RunPodJob[{self.job_id}]: GET /status")
         t0 = time.monotonic()
         response = requests.get(
@@ -1559,10 +1559,31 @@ class RunPodJob:
         logger.debug(f"RunPodJob[{self.job_id}]: status HTTP {response.status_code} in {time.monotonic()-t0:.2f}s")
         response.raise_for_status()
 
-        status_response = response.json()
-        job_status = status_response.get("status", "UNKNOWN")
-        logger.debug(f"RunPodJob[{self.job_id}]: status={job_status}")
-        return job_status
+        body = response.json()
+        logger.debug(f"RunPodJob[{self.job_id}]: status={body.get('status', 'UNKNOWN')}")
+        return body
+
+    def _stream_ended(self):
+        """Decide what a /stream response that carries no more data means.
+
+        /stream reports COMPLETED for jobs that have actually failed, and for
+        jobs that have not started yet, so the job's real outcome has to be read
+        back from /status. Returns True when the job is genuinely finished and
+        False when streaming should continue; raises if the job failed.
+        """
+        body = self.status_body()
+        job_status = body.get("status", "UNKNOWN")
+
+        if job_status in ('IN_QUEUE', 'IN_PROGRESS'):
+            logger.debug(f"RunPodJob[{self.job_id}]: stream ended early, job is {job_status}, continuing")
+            time.sleep(1)
+            return False
+
+        if job_status != 'COMPLETED':
+            logger.error(f"RunPodJob[{self.job_id}]: job {job_status}: {body.get('error')}")
+            raise Exception(f"RunPod job {job_status}: {body.get('error')}")
+
+        return True
 
     def stream(self):
         """Stream job results"""
@@ -1591,8 +1612,10 @@ class RunPodJob:
                 logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} parsed job_status={job_status} stream_items={len(stream_block)}")
 
                 if job_status not in ['IN_PROGRESS', 'COMPLETED']:
-                    logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} non-progress status={job_status}, breaking")
-                    break
+                    logger.debug(f"RunPodJob[{self.job_id}]: stream iter={iter_n} non-progress status={job_status}")
+                    if self._stream_ended():
+                        return
+                    continue
 
                 yielded_segments = 0
                 yielded_progress = 0
@@ -1624,11 +1647,13 @@ class RunPodJob:
 
                 if data['status'] == 'COMPLETED':
                     logger.debug(f"RunPodJob[{self.job_id}]: stream COMPLETED after iter={iter_n}")
-                    return
+                    if self._stream_ended():
+                        return
 
             except json.JSONDecodeError as e:
                 logger.error(f"RunPodJob[{self.job_id}]: failed to parse stream JSON: {e}")
-                return
+                if self._stream_ended():
+                    return
 
     def cancel(self):
         """Cancel the job"""
@@ -1645,12 +1670,7 @@ class RunPodJob:
 
     def get_timings(self):
         """Fetch RunPod billing timings (delayTime/executionTime, in ms) from /status."""
-        response = requests.get(
-            f"{self.base_url}/status/{self.job_id}",
-            headers=self.headers,
-        )
-        response.raise_for_status()
-        data = response.json()
+        data = self.status_body()
         return {
             "queue_ms": data.get("delayTime"),
             "execution_ms": data.get("executionTime"),
@@ -1690,16 +1710,37 @@ class AsyncRunPodJob:
                 self.job_id = result.get("id")
                 logger.debug(f"AsyncRunPodJob[{self.job_id}]: submitted")
 
-    async def status(self):
-        """Get job status asynchronously"""
+    async def status_body(self):
+        """Fetch /status. A failed job's error is reported here and nowhere else."""
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"{self.base_url}/status/{self.job_id}",
                 headers=self.headers
             ) as response:
                 response.raise_for_status()
-                status_response = await response.json()
-                return status_response.get("status", "UNKNOWN")
+                return await response.json()
+
+    async def _stream_ended(self):
+        """Decide what a /stream response that carries no more data means.
+
+        /stream reports COMPLETED for jobs that have actually failed, and for
+        jobs that have not started yet, so the job's real outcome has to be read
+        back from /status. Returns True when the job is genuinely finished and
+        False when streaming should continue; raises if the job failed.
+        """
+        body = await self.status_body()
+        job_status = body.get("status", "UNKNOWN")
+
+        if job_status in ('IN_QUEUE', 'IN_PROGRESS'):
+            logger.debug(f"AsyncRunPodJob[{self.job_id}]: stream ended early, job is {job_status}, continuing")
+            await asyncio.sleep(1)
+            return False
+
+        if job_status != 'COMPLETED':
+            logger.error(f"AsyncRunPodJob[{self.job_id}]: job {job_status}: {body.get('error')}")
+            raise Exception(f"RunPod job {job_status}: {body.get('error')}")
+
+        return True
 
     async def stream(self):
         """Stream job results asynchronously"""
@@ -1716,7 +1757,9 @@ class AsyncRunPodJob:
                         content = await response.text()
                         data = json.loads(content)
                         if data['status'] not in ['IN_PROGRESS', 'COMPLETED']:
-                            break
+                            if await self._stream_ended():
+                                return
+                            continue
 
                         for item in data['stream']:
                             if 'output' in item:
@@ -1741,11 +1784,13 @@ class AsyncRunPodJob:
                                         yield exc if index is None else (index, exc)
 
                         if data['status'] == 'COMPLETED':
-                            return
+                            if await self._stream_ended():
+                                return
 
                     except json.JSONDecodeError as e:
                         logger.error(f"Failed to parse RunPod async JSON response: {e}")
-                        return
+                        if await self._stream_ended():
+                            return
 
     async def cancel(self):
         """Cancel the job asynchronously"""
@@ -1759,17 +1804,11 @@ class AsyncRunPodJob:
 
     async def get_timings(self):
         """Fetch RunPod billing timings (delayTime/executionTime, in ms) from /status."""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{self.base_url}/status/{self.job_id}",
-                headers=self.headers
-            ) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return {
-                    "queue_ms": data.get("delayTime"),
-                    "execution_ms": data.get("executionTime"),
-                }
+        data = await self.status_body()
+        return {
+            "queue_ms": data.get("delayTime"),
+            "execution_ms": data.get("executionTime"),
+        }
 
 
 class RunPodModel(TranscriptionModel):
@@ -2064,7 +2103,8 @@ class RunPodModel(TranscriptionModel):
 
         status = None
         for i in range(self.IN_QUEUE_TIMEOUT):
-            status = run_request.status()
+            status_body = run_request.status_body()
+            status = status_body.get("status", "UNKNOWN")
             if status == "IN_QUEUE":
                 emit_progress(
                     on_progress,
@@ -2099,7 +2139,7 @@ class RunPodModel(TranscriptionModel):
             )
             run_request.cancel()
             run_request = None
-            raise Exception(f"Transcription failed: unexpected job status '{status}'")
+            raise Exception(f"Transcription failed: RunPod job {status}: {status_body.get('error')}")
 
         # Collect streaming results
         timeouts = 0
@@ -2351,7 +2391,8 @@ class RunPodModel(TranscriptionModel):
 
         status = None
         for i in range(self.IN_QUEUE_TIMEOUT):
-            status = await run_request.status()
+            status_body = await run_request.status_body()
+            status = status_body.get("status", "UNKNOWN")
             if status == "IN_QUEUE":
                 emit_progress(
                     on_progress,
@@ -2386,7 +2427,7 @@ class RunPodModel(TranscriptionModel):
             )
             await run_request.cancel()
             run_request = None
-            raise Exception(f"Transcription failed: unexpected job status '{status}'")
+            raise Exception(f"Transcription failed: RunPod job {status}: {status_body.get('error')}")
 
         # Collect streaming results
         timeouts = 0
